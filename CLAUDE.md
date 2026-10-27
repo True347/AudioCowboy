@@ -59,7 +59,11 @@ There is only one `ActionKeyword` (`ac`), and sub-commands are parsed from the q
 not the top menu, to keep the model object-first (list → Enter applies); `ac r` renames
 (encodes `Old → New` in the box, split on the `_RENAME_SEP` arrow against known names so
 spaces don't break parsing) and `ac d` deletes (re-lists after each delete via
-`delete_profile_relist` so several can go in a row). This is deliberate: in the V1 Python model the
+`delete_profile_relist` so several can go in a row). Any query whose first word isn't a
+sub-command falls through to profile-name matching (`ac gaming` applies "Gaming" from the
+root; no match → top menu), ranked by `_name_rank` (exact > prefix > substring, always above
+the Save/Rename/Delete entries so Enter applies the best match — issue #1). Sub-command words
+win, so a profile named e.g. "Out Loud" is only reachable via `ac p`. This is deliberate: in the V1 Python model the
 request does **not** include which keyword fired, so separate keywords (`aco`/`aci`/…)
 can't be distinguished on an empty query. The nested-menu feel is faked by `drill()`,
 which returns a `Flow.Launcher.ChangeQuery` action that rewrites the search box and keeps

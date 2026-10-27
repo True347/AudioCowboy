@@ -11,6 +11,7 @@ Flow.Launcher.ChangeQuery drill-down.
     ac i [filter]   list input  (capture) devices -> Enter sets default input
     ac s [name]     save current devices as a named profile
     ac p [filter]   list saved profiles -> Enter applies; right-click = Apply/Delete
+    ac <name>       anything that isn't a sub-command matches profile names -> Enter applies
 
 Flow Launcher V1 Python model: the request arrives as JSON in ``sys.argv[1]`` and the
 response is JSON on stdout. ``query``/``context_menu`` return a list (wrapped in
@@ -96,6 +97,24 @@ def _back_item():
     return drill("← Back", "Return to the main menu", "", ico=ICON_BACK, score=-100)
 
 
+def _name_rank(name, filt_l):
+    """Score a profile name against a lowercase filter; None if it doesn't match.
+
+    Exact > prefix > substring, and every match outranks the Save/Rename/Delete entries
+    (score <= 0), so the best match is the highlighted row and Enter applies it.
+    """
+    n = name.lower()
+    if not filt_l:
+        return 50
+    if filt_l not in n:
+        return None
+    if n == filt_l:
+        return 80
+    if n.startswith(filt_l):
+        return 70
+    return 60
+
+
 class AudioCowboy(object):
     def __init__(self):
         try:
@@ -166,6 +185,11 @@ class AudioCowboy(object):
             return self._delete_menu(rest)
         if head in ("r", "ren", "rename"):
             return self._rename_menu(rest)
+        # Anything else is a profile name: "ac gaming" applies it straight from the root.
+        # Sub-command words above win, so a profile named e.g. "Out Loud" needs `ac p`.
+        matches = self._profile_matches(profiles.list_profiles(), text.lower())
+        if matches:
+            return [_back_item()] + matches
         return self._top_menu()
 
     def context_menu(self, data=None):
@@ -314,18 +338,31 @@ class AudioCowboy(object):
         items.append(drill("\U0001F5D1  Delete a profile…", "Remove a saved profile",
                            "d ", ICON_DELETE, score=-20))
 
+        matches = self._profile_matches(profs, filt_l)
+        items.extend(matches)
+        if not matches:
+            items.append(result("No matching profiles", "Try a different filter", ICON_WARN))
+        return items
+
+    def _profile_matches(self, profs, filt_l):
+        """Apply-on-Enter items for the profiles whose name matches ``filt_l``, ranked."""
+        ranked = []
+        for p in profs:
+            score = _name_rank(p.get("name", ""), filt_l)
+            if score is not None:
+                ranked.append((p, score))
+        if not ranked:
+            return []
+
         current_ids = set()
         try:
             current_ids = {d["id"] for d in audio.get_devices(include_inactive=True)}
         except audio.AudioError:
             pass  # availability badge is optional; surface unexpected (non-audio) bugs
 
-        matched = 0
-        for p in profs:
+        items = []
+        for p, score in ranked:
             pname = p.get("name", "")
-            if filt_l and filt_l not in pname.lower():
-                continue
-            matched += 1
             out = p.get("output") or {}
             inp = p.get("input") or {}
             sub = "Out: %s   |   In: %s" % (out.get("friendlyName") or "?",
@@ -337,9 +374,7 @@ class AudioCowboy(object):
                     sub += "   ⚠ %s unavailable" % " & ".join(missing)
             items.append(result("\U0001F4C1  " + pname, sub, ICON_PROFILE,
                                 method="load_profile", params=[pname],
-                                context=["profile", pname]))
-        if matched == 0:
-            items.append(result("No matching profiles", "Try a different filter", ICON_WARN))
+                                context=["profile", pname], score=score))
         return items
 
     def _delete_menu(self, filt):

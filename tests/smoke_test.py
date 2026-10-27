@@ -291,6 +291,59 @@ def test_delete_rename_wire():
     print("OK  delete + rename wire (parsing + one-payload actions)")
 
 
+def test_profile_ranking_wire():
+    """The best-matching profile must be the highlighted row (top Score) so Enter applies
+    it — in `ac p <filter>` and straight from the root (`ac <name>`). Issue #1."""
+    tmp = tempfile.mkdtemp()
+    os.environ["APPDATA"] = tmp
+    os.makedirs(os.path.join(tmp, "FlowLauncher"))
+    import profiles
+    importlib.reload(profiles)
+    for name in ("My Realtek", "Realtek", "Realtek Speakers", "Headset"):
+        profiles.save_profile(name, output={"id": "O-" + name, "friendly": "Spk"}, input=None)
+
+    def ranked(q):
+        out, err = run_main({"method": "query", "parameters": [q], "settings": {}})
+        assert err.strip() == "", "stderr for %r:\n%s" % (q, err)
+        # Flow orders results by Score desc (stable); the first one is highlighted
+        return sorted(json.loads(out)["result"], key=lambda r: -r["Score"])
+
+    def applies(r):
+        act = r.get("JsonRPCAction", {})
+        return act["parameters"][0] if act.get("method") == "load_profile" else None
+
+    # ac p: profiles outrank Save/Rename/Delete (object-first), saved order kept
+    res = ranked("p")
+    assert [applies(r) for r in res[:4]] == ["My Realtek", "Realtek", "Realtek Speakers",
+                                             "Headset"], [r["Title"] for r in res]
+
+    # filtered: exact > prefix > substring, non-matches dropped
+    want = ["Realtek", "Realtek Speakers", "My Realtek"]
+    res = ranked("p realtek")
+    assert [applies(r) for r in res[:3]] == want, [r["Title"] for r in res]
+    assert "Headset" not in [applies(r) for r in res]
+
+    # root: a non-sub-command query matches profile names (case-insensitive), same ranking
+    res = ranked("REALTEK")
+    assert [applies(r) for r in res[:3]] == want, [r["Title"] for r in res]
+    assert res[0].get("ContextData") == ["profile", "Realtek"]  # Shift+Enter menu works
+    assert applies(ranked("head")[0]) == "Headset"
+    assert applies(ranked("realtek sp")[0]) == "Realtek Speakers"
+
+    # root: no match -> the unchanged top menu
+    top = json.loads(run_main({"method": "query", "parameters": [""], "settings": {}})[0])
+    nomatch = json.loads(run_main({"method": "query", "parameters": ["zzz"], "settings": {}})[0])
+    assert nomatch == top, nomatch
+
+    # sub-command words still route to their menus, never to root profile matching
+    profiles.save_profile("Out Loud", output={"id": "OL", "friendly": "Spk"}, input=None)
+    assert not [r for r in ranked("out loud") if applies(r)]
+    assert applies(ranked("p out loud")[0]) == "Out Loud"  # still reachable via ac p
+
+    shutil.rmtree(tmp, ignore_errors=True)
+    print("OK  profile ranking (ac p filter + root-level apply)")
+
+
 if __name__ == "__main__":
     test_profiles()
     test_rename()
@@ -299,4 +352,5 @@ if __name__ == "__main__":
     test_pycaw_warning_suppressed()
     test_wire()
     test_delete_rename_wire()
+    test_profile_ranking_wire()
     print("\nALL PASS")
