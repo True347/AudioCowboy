@@ -155,6 +155,69 @@ def test_pycaw_warning_suppressed():
     print("OK  pycaw warning suppressed (stderr stays clean)")
 
 
+def test_pycaw_devices_mapping():
+    """_pycaw_devices against a fake pycaw: real endpoint states, the requested state mask
+    on BOTH flows, and a stable id that degrades to None when it can't be read."""
+    import types
+    from enum import Enum
+    import audio
+    importlib.reload(audio)
+
+    class EDataFlow(Enum):
+        eRender = 0
+        eCapture = 1
+
+    class DEVICE_STATE(Enum):
+        ACTIVE = 0x1
+        MASK_ALL = 0xF
+
+    class State(Enum):
+        Active = 0x1
+        NotPresent = 0x4
+
+    class Dev(object):
+        def __init__(self, i, name, state):
+            self.id, self.FriendlyName, self.state = i, name, state
+
+    calls = []
+    by_flow = {0: [Dev("R1", "Speakers (FiiO K11)", State.NotPresent), Dev("R2", "Spk", State.Active)],
+               1: [Dev("C1", "Mic", State.Active)]}
+
+    class AudioUtilities(object):
+        SetDefaultDevice = None
+        GetSpeakers = staticmethod(lambda: Dev("R2", "Spk", State.Active))
+        GetMicrophone = staticmethod(lambda: Dev("C1", "Mic", State.Active))
+
+        @staticmethod
+        def GetAllDevices(data_flow, device_state):
+            calls.append((data_flow, device_state))
+            return by_flow[data_flow]
+
+    fake = {"pycaw": types.ModuleType("pycaw"), "pycaw.pycaw": types.ModuleType("pycaw.pycaw"),
+            "pycaw.constants": types.ModuleType("pycaw.constants")}
+    fake["pycaw.pycaw"].AudioUtilities = AudioUtilities
+    fake["pycaw.constants"].EDataFlow = EDataFlow
+    fake["pycaw.constants"].DEVICE_STATE = DEVICE_STATE
+    saved = {k: sys.modules.get(k) for k in fake}
+    sys.modules.update(fake)
+    try:
+        devs = audio._pycaw_devices(include_inactive=True)
+        assert calls == [(0, 0xF), (1, 0xF)], calls  # the mask must not leak per device
+        assert [(d["id"], d["state"], d["is_default"]) for d in devs] == [
+            ("R1", "Not present", False), ("R2", "Active", True), ("C1", "Active", True)], devs
+        assert all(d["stable_id"] is None for d in devs)  # no comtypes here -> None, no raise
+        calls[:] = []
+        audio._pycaw_devices(include_inactive=False)
+        assert calls == [(0, 0x1), (1, 0x1)], calls
+    finally:
+        for k, v in saved.items():
+            if v is None:
+                sys.modules.pop(k, None)
+            else:
+                sys.modules[k] = v
+    print("OK  pycaw device mapping (real states, per-flow state mask)")
+
+
 def run_main(req):
     proc = subprocess.run(
         [sys.executable, os.path.join(ROOT, "main.py"), json.dumps(req)],
@@ -343,6 +406,241 @@ def test_profile_ranking_wire():
     shutil.rmtree(tmp, ignore_errors=True)
     print("OK  profile ranking (ac p filter + root-level apply)")
 
+def test_resolve():
+    """Slot -> live endpoint: known ids (in order) > stable id > unique name match."""
+    import audio
+    importlib.reload(audio)
+    nk = audio.name_key
+    assert nk("Speakers (2- FiiO K11)") == nk("Speakers (FiiO K11)") == "speakers (fiio k11)"
+    assert nk("2- Speakers") == "speakers" and nk("Speakers (FiiO K11) (2)") == nk("speakers  (FiiO K11)")
+    assert nk("Speakers (Realtek(R) Audio)") == "speakers (realtek(r) audio)"  # "(R)" kept
+    assert nk("") == "" and nk(None) == ""
+
+    def dev(i, friendly, state="Active", stable=None, direction="render"):
+        return {"id": i, "direction": direction, "friendly": friendly, "state": state,
+                "stable_id": stable, "is_default": False}
+
+    uac2 = dev("U2", "Speakers (FiiO K11)", state="Not present", stable="S2")
+    uac1 = dev("U1", "Speakers (2- FiiO K11)", stable="S1")
+    rtk = dev("R", "Speakers (Realtek)")
+    mic = dev("M", "Speakers (FiiO K11)", direction="capture")  # wrong direction: ignored
+    devs = [uac2, uac1, rtk, mic]
+
+    # a known id only counts while its endpoint is Active
+    assert audio.resolve(devs, "render", ["R"]) == (rtk, "id")
+    assert audio.resolve(devs, "render", ["U2", "U1"]) == (uac1, "id")
+    assert audio.resolve(devs, "render", ["R", "U1"])[0] is rtk  # primary id wins
+    # stable id beats the name, and needs no name match at all
+    assert audio.resolve(devs, "render", ["gone"], ["S1"], "whatever") == (uac1, "stable")
+    # name fallback: the UAC2 endpoint is Not present, the UAC1 one is the unique match
+    assert audio.resolve(devs, "render", ["U2"], ["S2"], "Speakers (FiiO K11)") == (uac1, "name")
+    # two active endpoints with the same name: never guess
+    twin = dev("T", "Speakers (FiiO K11)")
+    assert audio.resolve(devs + [twin], "render", ["U2"], (), "Speakers (FiiO K11)") == (None, "ambiguous")
+    assert audio.resolve(devs, "render", ["U2"], (), "Headphones (Other)") == (None, "absent")
+    assert audio.resolve(devs, "render", [], (), "") == (None, "absent")
+    print("OK  resolve (id > stable id > unique name)")
+
+
+def test_profile_ids():
+    """altIds / stableIds: stored, learned, linked, and kept across a same-device overwrite."""
+    tmp = tempfile.mkdtemp()
+    os.environ["APPDATA"] = tmp
+    os.makedirs(os.path.join(tmp, "FlowLauncher"))
+    import profiles
+    importlib.reload(profiles)
+
+    profiles.save_profile("DAC", output={"id": "U2", "friendly": "Spk (FiiO)", "stable_id": "S2"},
+                          input={"id": "M", "friendly": "Mic"})
+    rec = profiles.get_profile("DAC")["output"]
+    assert rec == {"endpointId": "U2", "friendlyName": "Spk (FiiO)", "stableIds": ["S2"]}, rec
+    assert "stableIds" not in profiles.get_profile("DAC")["input"]  # no stable id: key omitted
+    assert profiles.record_ids(None) == [] and profiles.record_ids(rec) == ["U2"]
+
+    # remember the other UAC mode's endpoint: primary id kept, label kept
+    other = {"id": "U1", "friendly": "Spk (2- FiiO)", "stable_id": "S1"}
+    assert profiles.remember_device("dac", "output", other) is True
+    rec = profiles.get_profile("DAC")["output"]
+    assert rec["endpointId"] == "U2" and rec["altIds"] == ["U1"]
+    assert rec["stableIds"] == ["S2", "S1"] and rec["friendlyName"] == "Spk (FiiO)"
+    assert profiles.record_ids(rec) == ["U2", "U1"]
+    assert profiles.remember_device("DAC", "output", other) is False  # nothing new: no write
+    assert profiles.remember_device("nope", "output", other) is False
+    try:
+        profiles.remember_device("DAC", "speakers", other)
+        assert False, "unknown slot should raise"
+    except ValueError:
+        pass
+
+    # overwrite while on a KNOWN endpoint: that id becomes primary, the others stay
+    profiles.save_profile("DAC", output={"id": "U1", "friendly": "Spk (2- FiiO)", "stable_id": "S1"},
+                          input=None)
+    rec = profiles.get_profile("DAC")["output"]
+    assert rec["endpointId"] == "U1" and rec["altIds"] == ["U2"], rec
+    assert rec["stableIds"] == ["S1", "S2"] and rec["friendlyName"] == "Spk (2- FiiO)"
+
+    # overwrite with a DIFFERENT device (unknown id and stable id): learned ids are dropped
+    profiles.save_profile("DAC", output={"id": "R", "friendly": "Spk (FiiO)"}, input=None)
+    assert profiles.get_profile("DAC")["output"] == {"endpointId": "R", "friendlyName": "Spk (FiiO)"}
+
+    # drop: forget deleted ids; a dropped primary hands its place to the device
+    profiles.save_profile("Rot", output={"id": "P", "friendly": "Spk"}, input=None)
+    profiles.remember_device("Rot", "output", {"id": "A", "friendly": "Spk"})
+    assert profiles.remember_device("Rot", "output", {"id": "N", "friendly": "Spk", "stable_id": "SN"},
+                                    drop=["P"]) is True
+    rec = profiles.get_profile("Rot")["output"]
+    assert rec["endpointId"] == "N" and rec["altIds"] == ["A"] and rec["stableIds"] == ["SN"], rec
+    # dropping a non-primary id keeps the primary first
+    assert profiles.remember_device("Rot", "output", {"id": "M", "friendly": "Spk"}, drop=["A"]) is True
+    assert profiles.record_ids(profiles.get_profile("Rot")["output"]) == ["N", "M"]
+
+    # an empty slot just takes the linked device
+    assert profiles.remember_device("DAC", "input", {"id": "M2", "friendly": "Mic 2"}) is True
+    assert profiles.get_profile("DAC")["input"] == {"endpointId": "M2", "friendlyName": "Mic 2"}
+
+    shutil.rmtree(tmp, ignore_errors=True)
+    print("OK  profile altIds / stableIds (remember, link, overwrite)")
+
+
+class _FakeBackend(object):
+    """Stands in for audio.get_devices / set_default inside main.py (in-process)."""
+
+    def __init__(self, devices):
+        self.devices = devices
+        self.set_calls = []
+
+    def get_devices(self, include_inactive=False):
+        return [dict(d) for d in self.devices if include_inactive or d["state"] == "Active"]
+
+    def set_default(self, item_id, role="all"):
+        self.set_calls.append(item_id)
+        direction = [d for d in self.devices if d["id"] == item_id][0]["direction"]
+        for d in self.devices:
+            if d["direction"] == direction:
+                d["is_default"] = d["id"] == item_id
+        return True
+
+
+def _run_inproc(main_mod, method, params):
+    """Run one Flow request through main.AudioCowboy in-process; return the parsed payload."""
+    import io
+    argv, stdout = sys.argv, sys.stdout
+    sys.argv = ["main.py", json.dumps({"method": method, "parameters": params, "settings": {}})]
+    sys.stdout = buf = io.StringIO()
+    try:
+        main_mod.AudioCowboy()
+    finally:
+        sys.argv, sys.stdout = argv, stdout
+    return json.loads(buf.getvalue())
+
+
+def test_mode_switch_apply():
+    """A DAC in its other UAC mode is a new endpoint: the profile still applies (by name),
+    the context menu offers a link, and a link (or a stable-id hit) is remembered."""
+    tmp = tempfile.mkdtemp()
+    os.environ["APPDATA"] = tmp
+    os.makedirs(os.path.join(tmp, "FlowLauncher"))
+    import profiles
+    importlib.reload(profiles)
+    import main
+    saved = (main.audio.get_devices, main.audio.set_default)
+
+    def dev(i, friendly, state="Active", stable=None, direction="render", default=False):
+        return {"id": i, "direction": direction, "friendly": friendly, "state": state,
+                "stable_id": stable, "is_default": default, "is_default_comm": False}
+
+    def toast(obj):
+        assert obj["method"] == "Flow.Launcher.ShowMsg", obj
+        return obj["parameters"][0], obj["parameters"][1]
+
+    def links(name):
+        res = _run_inproc(main, "context_menu", [["profile", name]])["result"]
+        return [r["JsonRPCAction"]["parameters"] for r in res
+                if r.get("JsonRPCAction", {}).get("method") == "link_device"]
+
+    try:
+        # saved in UAC2 (U2); now the DAC is in UAC1 (U1, Windows numbered it "2- ")
+        profiles.save_profile("DAC", output={"id": "U2", "friendly": "Speakers (FiiO K11)",
+                                             "stable_id": "S2"}, input=None)
+        fake = _FakeBackend([
+            dev("U2", "Speakers (FiiO K11)", state="Not present", stable="S2"),
+            dev("U1", "Speakers (2- FiiO K11)", stable="S1"),
+            dev("R", "Speakers (Realtek)", default=True),
+        ])
+        main.audio.get_devices, main.audio.set_default = fake.get_devices, fake.set_default
+
+        title, sub = toast(_run_inproc(main, "load_profile", ["DAC"]))
+        assert fake.set_calls == ["U1"] and title == "Applied profile: DAC", (title, sub)
+        assert "(by name)" in sub, sub
+        # U2 still exists (Not present), so the name hit may be a twin: nothing is stored
+        assert profiles.get_profile("DAC")["output"] == {
+            "endpointId": "U2", "friendlyName": "Speakers (FiiO K11)", "stableIds": ["S2"]}
+
+        # badge: the name fallback finds it, so the profile isn't flagged unavailable
+        res = _run_inproc(main, "query", ["p"])["result"]
+        assert [r for r in res if r["Title"].endswith("DAC") and "⚠" not in r["SubTitle"]], res
+
+        # link offers just the name pick (no input slot -> no input links)
+        assert links("DAC") == [["DAC", "output", "U1"]], links("DAC")
+
+        # linking remembers U1 for good, then applies by id (no "(by name)")
+        fake.set_calls[:] = []
+        title, sub = toast(_run_inproc(main, "link_device", ["DAC", "output", "U1"]))
+        rec = profiles.get_profile("DAC")["output"]
+        assert rec["endpointId"] == "U2" and rec["altIds"] == ["U1"] and rec["stableIds"] == ["S2", "S1"]
+        assert fake.set_calls == ["U1"] and title == "Applied profile: DAC" and "(by name)" not in sub
+        assert links("DAC") == []  # resolves by id now
+
+        # back in UAC2: the primary id is live again and wins
+        fake.devices[0]["state"], fake.devices[1]["state"] = "Active", "Not present"
+        fake.set_calls[:] = []
+        toast(_run_inproc(main, "load_profile", ["DAC"]))
+        assert fake.set_calls == ["U2"]
+
+        # Windows deleted the saved endpoint outright (not even "Not present") and made a
+        # new one: the name hit re-points the slot, dropping the dead id, and keeps the
+        # stable id so the next lookup is direct
+        profiles.save_profile("Rotated", output={"id": "DEAD", "friendly": "耳機 (2- FiiO K12)"},
+                              input=None)
+        fake.devices.append(dev("FRESH", "耳機 (FiiO K12)", stable="SF"))
+        fake.set_calls[:] = []
+        title, sub = toast(_run_inproc(main, "load_profile", ["Rotated"]))
+        assert fake.set_calls == ["FRESH"] and "(by name)" in sub, (title, sub)
+        rec = profiles.get_profile("Rotated")["output"]
+        assert rec["endpointId"] == "FRESH" and "altIds" not in rec and rec["stableIds"] == ["SF"], rec
+        assert rec["friendlyName"] == "耳機 (2- FiiO K12)"  # the saved label stays
+        _, sub = toast(_run_inproc(main, "load_profile", ["Rotated"]))
+        assert "(by name)" not in sub, sub
+
+        # stable-id hit under a new endpoint id + new name: applied AND the id is learned
+        profiles.save_profile("Stable", output={"id": "OLD", "friendly": "Spk",
+                                                "stable_id": "S9"}, input=None)
+        fake.devices.append(dev("NEW", "Headphones (Renamed)", stable="S9"))
+        fake.set_calls[:] = []
+        title, _ = toast(_run_inproc(main, "load_profile", ["Stable"]))
+        assert fake.set_calls == ["NEW"] and title == "Applied profile: Stable"
+        assert profiles.get_profile("Stable")["output"]["altIds"] == ["NEW"]
+
+        # two active endpoints share the saved name: refuse to guess, switch nothing
+        profiles.save_profile("Twin", output={"id": "GONE", "friendly": "Speakers (USB Audio)"},
+                              input=None)
+        fake.devices += [dev("A1", "Speakers (USB Audio)"), dev("A2", "Speakers (2- USB Audio)")]
+        fake.set_calls[:] = []
+        title, sub = toast(_run_inproc(main, "load_profile", ["Twin"]))
+        assert fake.set_calls == [] and title.startswith("Could not apply"), (title, sub)
+        assert "several devices match" in sub and "Shift+Enter" in sub, sub
+
+        # nothing matches at all: flagged in the list, and every active output is linkable
+        profiles.save_profile("Lost", output={"id": "X", "friendly": "Headphones (Gone)"}, input=None)
+        res = _run_inproc(main, "query", ["p lost"])["result"]
+        assert [r for r in res if "⚠ output unavailable" in r["SubTitle"]], res
+        assert len(links("Lost")) == len([d for d in fake.devices
+                                          if d["state"] == "Active" and d["direction"] == "render"])
+    finally:
+        main.audio.get_devices, main.audio.set_default = saved
+        shutil.rmtree(tmp, ignore_errors=True)
+    print("OK  UAC mode switch (name fallback, link, stable-id learning, ambiguity)")
+
 
 if __name__ == "__main__":
     test_profiles()
@@ -350,7 +648,11 @@ if __name__ == "__main__":
     test_corruption_backup()
     test_audio_helpers()
     test_pycaw_warning_suppressed()
+    test_pycaw_devices_mapping()
     test_wire()
     test_delete_rename_wire()
     test_profile_ranking_wire()
+    test_resolve()
+    test_profile_ids()
+    test_mode_switch_apply()
     print("\nALL PASS")

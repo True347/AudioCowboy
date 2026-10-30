@@ -10,7 +10,7 @@ Flow.Launcher.ChangeQuery drill-down.
     ac o [filter]   list output (render) devices  -> Enter sets default output
     ac i [filter]   list input  (capture) devices -> Enter sets default input
     ac s [name]     save current devices as a named profile
-    ac p [filter]   list saved profiles -> Enter applies; right-click = Apply/Delete
+    ac p [filter]   list saved profiles -> Enter applies; right-click = Apply/Link/Rename/Delete
     ac <name>       anything that isn't a sub-command matches profile names -> Enter applies
 
 Flow Launcher V1 Python model: the request arrives as JSON in ``sys.argv[1]`` and the
@@ -49,6 +49,9 @@ KEYWORD = "ac"  # must match plugin.json "ActionKeyword"
 
 # Rename drill encodes "Old → New" in the query box; the arrow is the delimiter we split on.
 _RENAME_SEP = " → "
+
+# Appended to "Unavailable" toasts: where to fix a slot whose device got a new endpoint.
+_LINK_HINT = " — Shift+Enter the profile to link a device"
 
 ICON = "Images/app.png"
 ICON_OUT = "Images/output.png"
@@ -113,6 +116,16 @@ def _name_rank(name, filt_l):
     if n.startswith(filt_l):
         return 70
     return 60
+
+
+# Profile slot key -> device direction.
+_SLOTS = (("output", "render"), ("input", "capture"))
+
+
+def _resolve(rec, devices, direction):
+    """(device, how) for a saved profile slot — see audio.resolve."""
+    return audio.resolve(devices, direction, profiles.record_ids(rec),
+                         rec.get("stableIds") or (), rec.get("friendlyName") or "")
 
 
 class AudioCowboy(object):
@@ -202,6 +215,7 @@ class AudioCowboy(object):
                 result("Apply profile “%s”" % name,
                        "Set both devices (all roles)", ICON_PROFILE,
                        method="load_profile", params=[name]),
+            ] + self._link_items(name) + [
                 drill("Rename profile “%s”…" % name, "Give it a new name",
                       "r " + name + _RENAME_SEP, ICON_PROFILE),
                 result("Delete profile “%s”" % name,
@@ -354,9 +368,9 @@ class AudioCowboy(object):
         if not ranked:
             return []
 
-        current_ids = set()
+        live = []
         try:
-            current_ids = {d["id"] for d in audio.get_devices(include_inactive=True)}
+            live = audio.get_devices()
         except audio.AudioError:
             pass  # availability badge is optional; surface unexpected (non-audio) bugs
 
@@ -367,14 +381,52 @@ class AudioCowboy(object):
             inp = p.get("input") or {}
             sub = "Out: %s   |   In: %s" % (out.get("friendlyName") or "?",
                                             inp.get("friendlyName") or "?")
-            if current_ids:
-                missing = [lbl for rec, lbl in ((out, "output"), (inp, "input"))
-                           if rec.get("endpointId") and rec["endpointId"] not in current_ids]
+            if live:
+                # "Unavailable" = nothing active resolves to it (a known-but-unplugged
+                # endpoint doesn't count), so a DAC in its other mode isn't flagged when
+                # the name fallback will find it.
+                missing = [key for key, direction in _SLOTS
+                           if (p.get(key) or {}).get("endpointId")
+                           and _resolve(p[key], live, direction)[0] is None]
                 if missing:
                     sub += "   ⚠ %s unavailable" % " & ".join(missing)
             items.append(result("\U0001F4C1  " + pname, sub, ICON_PROFILE,
                                 method="load_profile", params=[pname],
                                 context=["profile", pname], score=score))
+        return items
+
+    def _link_items(self, name):
+        """Context-menu "Use … as this profile's output/input" entries.
+
+        Offered only for a slot that no known id or stable id resolves — typically a DAC
+        switched to its other UAC mode, which Windows treats as a new endpoint. Linking
+        adds that endpoint to the slot for good. If the name fallback found a device, only
+        that one is offered; otherwise every active device of the direction.
+        """
+        p = profiles.get_profile(name)
+        if not p:
+            return []
+        try:
+            live = audio.get_devices()
+        except audio.AudioError:
+            return []  # optional entries; Apply/Rename/Delete still work
+        items = []
+        for key, direction in _SLOTS:
+            rec = p.get(key) or {}
+            if not rec.get("endpointId"):
+                continue
+            picked, how = _resolve(rec, live, direction)
+            if how in ("id", "stable"):
+                continue
+            kind = "output" if direction == "render" else "input"
+            cands = [picked] if picked else [d for d in live if d["direction"] == direction]
+            for d in cands:
+                items.append(result(
+                    "\U0001F517  Use “%s” as this profile's %s" % (d["friendly"], kind),
+                    "Remember it alongside “%s” (e.g. the DAC's other USB mode) and apply"
+                    % (rec.get("friendlyName") or "?"),
+                    ICON_OUT if direction == "render" else ICON_IN,
+                    method="link_device", params=[name, key, d["id"]]))
         return items
 
     def _delete_menu(self, filt):
@@ -567,19 +619,41 @@ class AudioCowboy(object):
         if not p:
             self.show_msg("Profile not found", name, _abs(ICON_ERROR))
             return
-        targets = []  # (endpointId, direction, label)
-        for key, direction, label in (("output", "render", "Out"), ("input", "capture", "In")):
-            rec = p.get(key) or {}
-            if rec.get("endpointId"):
-                targets.append((rec["endpointId"], direction, rec.get("friendlyName") or rec["endpointId"]))
-        if not targets:
+        slots = [(key, direction, p[key]) for key, direction in _SLOTS
+                 if (p.get(key) or {}).get("endpointId")]
+        if not slots:
             self.show_msg("Profile “%s” is empty" % name, "Nothing to apply", _abs(ICON_WARN))
             return
+
+        # Resolve each slot to a live endpoint first: a known id, then a known stable id,
+        # then a unique name match — the same DAC in its other UAC mode is a different
+        # endpoint to Windows. If the list can't be read, try the saved id and let
+        # verification judge.
+        try:
+            live = audio.get_devices()
+        except audio.AudioBackendUnavailable:
+            self._backend_missing_toast()
+            return
+        except Exception:
+            live = None
+        targets = []  # (slot key, endpointId, label, how, resolved device or None)
+        absent = []
+        for key, direction, rec in slots:
+            saved = rec.get("friendlyName") or rec["endpointId"]
+            if live is None:
+                targets.append((key, rec["endpointId"], saved, "id", None))
+                continue
+            dev, how = _resolve(rec, live, direction)
+            if dev is None:
+                absent.append(saved + (" (several devices match)" if how == "ambiguous" else ""))
+            else:
+                label = dev["friendly"] + (" (by name)" if how == "name" else "")
+                targets.append((key, dev["id"], label, how, dev))
 
         # Set each device. Only a raised exception is a hard failure; the backend's own
         # success value is ignored — verification (below) is the source of truth.
         set_error = set()
-        for endpoint_id, _direction, _label in targets:
+        for _key, endpoint_id, _label, _how, _dev in targets:
             try:
                 audio.set_default(endpoint_id, "all")
             except audio.AudioBackendUnavailable:
@@ -593,14 +667,14 @@ class AudioCowboy(object):
         # retry off the verified state, NOT the backend's return value — a set that
         # reported failure but actually lands a moment later must still be caught.
         devices = None
-        for attempt in range(3):
+        for attempt in range(3 if targets else 0):
             try:
                 devices = audio.get_devices(include_inactive=True)
             except Exception:
                 devices = None
                 break
             pending = False
-            for eid, _dir, _lbl in targets:
+            for _key, eid, _lbl, _how, _dev in targets:
                 dev = audio.find_by_id(devices, eid)
                 if dev is not None and not dev["is_default"]:
                     pending = True
@@ -613,9 +687,9 @@ class AudioCowboy(object):
         #   applied    - confirmed default now
         #   unverified - couldn't re-read; backend reported success
         #   failed     - device present but did not become default (or the set failed)
-        #   absent     - endpoint not present on the system
-        applied, unverified, failed, absent = [], [], [], []
-        for endpoint_id, _direction, label in targets:
+        #   absent     - no live endpoint for the slot (resolved above, or vanished since)
+        applied, unverified, failed = [], [], []
+        for key, endpoint_id, label, how, resolved in targets:
             if devices is None:
                 # Can't verify: only a raised exception is a hard failure; an unreliable
                 # False return is genuinely unknown, so report it as unverified.
@@ -626,6 +700,8 @@ class AudioCowboy(object):
                 absent.append(label)
             elif dev["is_default"]:
                 applied.append(label)
+                if resolved is not None:
+                    self._learn(name, key, how, resolved, p[key], devices)
             else:
                 failed.append(label)
 
@@ -640,15 +716,57 @@ class AudioCowboy(object):
             if failed:
                 detail += "   Failed to set: %s" % ", ".join(failed)
             if absent:
-                detail += "   Unavailable: %s" % ", ".join(absent)
+                detail += "   Unavailable: %s%s" % (", ".join(absent), _LINK_HINT)
             self.show_msg("Applied “%s” — partial" % name, detail, _abs(ICON_WARN))
         else:
             parts = []
             if failed:
                 parts.append("Failed to set: %s" % ", ".join(failed))
             if absent:
-                parts.append("Unavailable: %s" % ", ".join(absent))
+                parts.append("Unavailable: %s%s" % (", ".join(absent), _LINK_HINT))
             self.show_msg("Could not apply “%s”" % name, "   ".join(parts), _abs(ICON_ERROR))
+
+    def _learn(self, name, key, how, dev, rec, devices):
+        """After a verified apply, store what makes the next lookup direct (best-effort).
+
+        An id / stable-id hit stores whichever of the two is new. A name hit is stored
+        only when Windows has deleted every endpoint the slot knew — none is listed in
+        ``devices`` (all states), not even as unplugged. Windows re-creates an endpoint
+        under a new id now and then (seen on a FiiO K11 with no USB change at all), and
+        re-pointing the slot lets its stable id be tracked from then on. While a known
+        endpoint still exists, a name hit may be the other of two identical devices, so
+        only an explicit link (the profile's context menu) may merge it in.
+        """
+        try:
+            if how != "name":
+                profiles.remember_device(name, key, dev)
+                return
+            known = profiles.record_ids(rec)
+            if not any(audio.find_by_id(devices, i) for i in known):
+                profiles.remember_device(name, key, dev, drop=known)
+        except Exception:
+            pass  # the switch itself succeeded
+
+    def link_device(self, name, key, item_id):
+        """Context-menu action: remember ``item_id`` for profile ``name``'s ``key`` slot
+        (e.g. the endpoint the DAC has in its other UAC mode), then apply the profile."""
+        try:
+            dev = audio.find_by_id(audio.get_devices(include_inactive=True), item_id)
+        except audio.AudioBackendUnavailable:
+            self._backend_missing_toast()
+            return
+        except Exception as exc:
+            self.show_msg("Failed to read current devices", str(exc), _abs(ICON_ERROR))
+            return
+        if dev is None:
+            self.show_msg("Device not found", item_id, _abs(ICON_WARN))
+            return
+        try:
+            profiles.remember_device(name, key, dev)
+        except Exception as exc:
+            self.show_msg("Failed to update profile", str(exc), _abs(ICON_ERROR))
+            return
+        self.load_profile(name)
 
     def delete_profile(self, name):
         try:

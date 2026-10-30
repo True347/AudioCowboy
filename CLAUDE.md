@@ -19,6 +19,7 @@ python tests/smoke_test.py        # profiles CRUD, device helpers, JSON-RPC wire
 # Live checks — Windows only, against real devices:
 python tests/inspect_live.py      # read-only: dumps the menus + device lists
 python tests/inspect_actions.py   # save/load/delete in a temp APPDATA (switch is a no-op)
+python tests/inspect_ids.py [name]  # read-only: endpoint id / stable id / state per endpoint
 
 # Vendor the runtime deps the way CI/release does (needed to run the pycaw backend locally):
 pip install -r requirements.txt -t ./lib
@@ -90,9 +91,24 @@ Three first-party modules with a clean split:
 
 ### Invariants that pervade the code
 
-- **Device identity is the MMDevice endpoint ID** (e.g. `{0.0.0.00000000}.{guid}`), never
-  the friendly name — stable across reboots and unique even for two identical headsets.
-  Profiles persist the id; friendly names are display-only labels.
+- **Device identity is the MMDevice endpoint ID** (e.g. `{0.0.0.00000000}.{guid}`) —
+  stable across reboots and unique even for two identical headsets — but it changes with
+  the driver, so one physical device can have several (a DAC switched UAC1 ↔ UAC2 is a
+  new endpoint each way). A profile slot therefore holds `endpointId` + optional `altIds`
+  and `stableIds` (`PKEY_AudioEndpoint_StableId`, Win11 24H2+), and `audio.resolve()`
+  maps a slot to an **Active** endpoint: known ids in order (primary wins) → known stable
+  id → the one active endpoint whose `name_key` (Windows' `2- `/`(2)` numbering stripped)
+  matches. Several name matches → "ambiguous", never a guess.
+- **Only exact identity is persisted** (`main._learn` → `profiles.remember_device`). A
+  stable-id hit stores the new endpoint id; an id hit backfills the stable id. A **name**
+  hit is applied but stored only when Windows has *deleted* every endpoint the slot knew
+  (none listed in any state) — then the slot is re-pointed (dead ids dropped) so its
+  stable id gets tracked. Windows does re-create endpoints under new ids with no USB
+  change (seen on a FiiO K11: delete + create in one PnP instant, monthly-ish). While a
+  known endpoint still exists (even unplugged), a name hit may be the other of two
+  identical headsets, so it is never stored; the user merges endpoints explicitly via the
+  profile context menu's link entries (`link_device`). `save_profile` carries learned ids
+  over only when the new device's id or stable id is already known for that slot.
 - **A backend "success" is not proof.** After any `set_default`, the code re-reads the
   device list to *verify* the default actually changed (`_is_now_default`, and the retry
   loop in `load_profile`), retrying a few times because Windows can apply the change just

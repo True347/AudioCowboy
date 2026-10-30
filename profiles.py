@@ -1,8 +1,15 @@
 """Profile persistence for AudioCowboy.
 
-A profile is a named snapshot of {default output device, default input device},
-each stored as {endpointId, friendlyName}. The endpoint id (MMDevice id) is the
-source of truth when applying a profile; the friendly name is only a display label.
+A profile is a named snapshot of {default output device, default input device}.
+Each slot is stored as::
+
+    {"endpointId": ..., "friendlyName": ..., "altIds": [...], "stableIds": [...]}
+
+``endpointId`` is the MMDevice id the profile was saved with. ``altIds`` are more
+endpoint ids for the same physical device (a DAC gets a different one in its other
+UAC mode) and ``stableIds`` its PKEY_AudioEndpoint_StableId values; both are optional
+and omitted when empty. Applying matches ids first, then stable ids, and only then a
+unique friendly-name match (see ``audio.resolve``).
 
 Profiles live OUTSIDE the plugin install folder (which Flow wipes on every update),
 under the roaming settings root:
@@ -108,12 +115,26 @@ def list_profiles():
     return load().get("profiles", [])
 
 
-def get_profile(name):
+def _find(profs, name):
     name_l = (name or "").strip().lower()
-    for p in load().get("profiles", []):
+    for p in profs:
         if (p.get("name") or "").strip().lower() == name_l:
             return p
     return None
+
+
+def get_profile(name):
+    return _find(load().get("profiles", []), name)
+
+
+def record_ids(rec):
+    """Every endpoint id known for a profile slot: the saved one first, then ``altIds``."""
+    out = []
+    if rec:
+        for dev_id in [rec.get("endpointId")] + list(rec.get("altIds") or []):
+            if dev_id and dev_id not in out:
+                out.append(dev_id)
+    return out
 
 
 def save_profile(name, output=None, input=None):
@@ -133,12 +154,48 @@ def save_profile(name, output=None, input=None):
         if (p.get("name") or "").strip().lower() == name.lower():
             entry["created"] = p.get("created", entry["created"])
             entry["updated"] = _now_iso()
+            for key in ("output", "input"):
+                entry[key] = _carry_ids(p.get(key), entry[key])
             profs[i] = entry
             break
     else:
         profs.append(entry)
     _save(data)
     return entry
+
+
+def remember_device(name, key, device, drop=()):
+    """Record ``device`` as another endpoint of profile ``name``'s ``key`` slot.
+
+    ``key`` is "output" or "input"; ``device`` is an audio device dict. Its id joins
+    ``altIds`` (the saved id stays primary) and its stable id joins ``stableIds``; an
+    empty slot simply takes the device. ``drop`` lists endpoint ids to forget (ones
+    Windows has deleted); if the primary is among them, the device's id becomes primary.
+    Returns True if the profile changed and was saved.
+    """
+    if key not in ("output", "input"):
+        raise ValueError("Unknown profile slot: %r" % key)
+    new = _device_record(device)
+    data = load()
+    target = _find(data["profiles"], name)
+    if target is None or new is None:
+        return False
+    old = target.get(key)
+    if not old or not old.get("endpointId"):
+        target[key] = new
+    else:
+        known = record_ids(old)
+        ids = [i for i in known if i not in drop]
+        stable = list(old.get("stableIds") or [])
+        more_ids = [i for i in record_ids(new) if i not in ids]
+        more_stable = [sid for sid in new.get("stableIds", []) if sid not in stable]
+        if not more_ids and not more_stable and ids == known:
+            return False
+        ids = ids + more_ids if ids[:1] == known[:1] else more_ids + ids
+        target[key] = _with_ids(old, ids, stable + more_stable)
+    target["updated"] = _now_iso()
+    _save(data)
+    return True
 
 
 def delete_profile(name):
@@ -188,7 +245,41 @@ def _device_record(device):
     dev_id = device.get("id") or device.get("endpointId")
     if not dev_id:
         return None
-    return {
+    rec = {
         "endpointId": dev_id,
         "friendlyName": device.get("friendly") or device.get("friendlyName") or "",
     }
+    if device.get("stable_id"):
+        rec["stableIds"] = [device["stable_id"]]
+    return rec
+
+
+def _with_ids(rec, ids, stable_ids):
+    """Copy of ``rec`` with ``ids[0]`` as endpointId, the rest as altIds, and stableIds."""
+    out = dict(rec)
+    out["endpointId"] = ids[0]
+    out.pop("altIds", None)
+    out.pop("stableIds", None)
+    if ids[1:]:
+        out["altIds"] = ids[1:]
+    if stable_ids:
+        out["stableIds"] = stable_ids
+    return out
+
+
+def _carry_ids(old, new):
+    """On overwrite, keep the ids learned for a slot if the new device is the same one.
+
+    "Same" means the new endpoint id or stable id is already known for the slot — never
+    a name match. The new id becomes primary; the old ones stay as altIds.
+    """
+    if not old or not new:
+        return new
+    old_ids = record_ids(old)
+    old_stable = list(old.get("stableIds") or [])
+    new_stable = new.get("stableIds", [])
+    if new["endpointId"] not in old_ids and not set(new_stable) & set(old_stable):
+        return new
+    ids = [new["endpointId"]] + [i for i in old_ids if i != new["endpointId"]]
+    stable = new_stable + [sid for sid in old_stable if sid not in new_stable]
+    return _with_ids(new, ids, stable)
