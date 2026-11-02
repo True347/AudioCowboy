@@ -406,6 +406,54 @@ def test_profile_ranking_wire():
     shutil.rmtree(tmp, ignore_errors=True)
     print("OK  profile ranking (ac p filter + root-level apply)")
 
+def test_ascii_wire():
+    """Every payload must be ASCII-only JSON. Flow decodes context_menu output with the
+    Windows ANSI code page (cp1252 on English Windows), so raw UTF-8 showed “Name” as
+    â€œNameâ€, broke the Rename drill's → and mangled non-ASCII names sent back as
+    action params. Issue #1 (follow-up)."""
+    tmp = tempfile.mkdtemp()
+    os.environ["APPDATA"] = tmp
+    os.makedirs(os.path.join(tmp, "FlowLauncher"))
+    import profiles
+    importlib.reload(profiles)
+    names = ("Realtek Motiv", "Kopfhörer 耳機")
+    for name in names:
+        profiles.save_profile(name, output={"id": "O-" + name, "friendly": "Spk"}, input=None)
+
+    def as_flow_reads(req):
+        out, err = run_main(req)
+        assert err.strip() == "", "stderr for %r:\n%s" % (req, err)
+        assert out.isascii(), "non-ASCII bytes on stdout for %r:\n%s" % (req, out)
+        return json.loads(out.encode("ascii").decode("cp1252"))  # what Flow's ReadToEnd sees
+
+    for name in names:
+        menu = as_flow_reads({"method": "context_menu",
+                              "parameters": [["profile", name]], "settings": {}})["result"]
+        assert menu[0]["Title"] == "Apply profile “%s”" % name, menu[0]["Title"]
+        assert menu[0]["JsonRPCAction"]["parameters"] == [name]
+        assert menu[-1]["JsonRPCAction"]["parameters"] == [name]  # Delete
+        # Follow the Rename drill the way Flow does: its query text goes into the box.
+        box = menu[1]["JsonRPCAction"]["parameters"][0]
+        assert box == "ac r %s → " % name, box
+        step = as_flow_reads({"method": "query", "parameters": [box[len("ac "):]],
+                              "settings": {}})["result"]
+        assert [r["Title"] for r in step if r["Title"].startswith("Rename")] == [
+            "Rename “%s” → …" % name], [r["Title"] for r in step]
+
+    # the other payload shapes: device context menu, query lists, an action's ShowMsg
+    as_flow_reads({"method": "context_menu",
+                   "parameters": [["device", "render", "{id}", "Lautsprecher (Realtek® Audio)"]],
+                   "settings": {}})
+    for q in ("", "p", "r", "d", "s Kopfhörer 耳機", "kopf"):
+        as_flow_reads({"method": "query", "parameters": [q], "settings": {}})
+    toast = as_flow_reads({"method": "delete_profile", "parameters": ["Nicht da ✏️"],
+                           "settings": {}})
+    assert toast["method"] == "Flow.Launcher.ShowMsg"
+    assert toast["parameters"][1] == "Nicht da ✏️", toast
+
+    shutil.rmtree(tmp, ignore_errors=True)
+    print("OK  ASCII-only wire (context menu survives Flow's ANSI decoding)")
+
 def test_resolve():
     """Slot -> live endpoint: known ids (in order) > stable id > unique name match."""
     import audio
@@ -652,6 +700,7 @@ if __name__ == "__main__":
     test_wire()
     test_delete_rename_wire()
     test_profile_ranking_wire()
+    test_ascii_wire()
     test_resolve()
     test_profile_ids()
     test_mode_switch_apply()

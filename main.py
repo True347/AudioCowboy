@@ -40,11 +40,6 @@ for _p in (PLUGIN_DIR, os.path.join(PLUGIN_DIR, "lib")):
 import audio
 import profiles
 
-try:  # emit real UTF-8 so non-ASCII device names render correctly
-    sys.stdout.reconfigure(encoding="utf-8")
-except Exception:
-    pass
-
 KEYWORD = "ac"  # must match plugin.json "ActionKeyword"
 
 # Rename drill encodes "Old → New" in the query box; the arrow is the delimiter we split on.
@@ -159,18 +154,24 @@ class AudioCowboy(object):
     # ------------------------------------------------------------------ #
     # wire helpers
     # ------------------------------------------------------------------ #
+    # Payloads are ASCII-only JSON (json.dumps' default \uXXXX escapes), never raw UTF-8.
+    # Flow reads query and action output as UTF-8 bytes, but context_menu output through
+    # StreamReader.ReadToEnd() with no encoding set, i.e. the Windows ANSI code page
+    # (cp1252, cp950, ...): raw UTF-8 there turned “Name” into â€œNameâ€ and broke the
+    # Rename drill's → separator and every non-ASCII profile name. ASCII reads the same
+    # under every code page.
     def _emit(self, results):
         if self._emitted:
             return
         self._emitted = True
-        sys.stdout.write(json.dumps({"result": results}, ensure_ascii=False))
+        sys.stdout.write(json.dumps({"result": results}))
         sys.stdout.flush()  # Flow reads one payload off the pipe; don't rely on exit flush
 
     def _flow(self, method, parameters):
         if self._emitted:
             return
         self._emitted = True
-        sys.stdout.write(json.dumps({"method": method, "parameters": parameters}, ensure_ascii=False))
+        sys.stdout.write(json.dumps({"method": method, "parameters": parameters}))
         sys.stdout.flush()
 
     def show_msg(self, title, sub_title="", ico_path=""):

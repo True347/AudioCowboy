@@ -44,6 +44,13 @@ everything:
   `Flow.Launcher.*` follow-up request instead (we use `ShowMsg` for toasts).
 - **Exactly one payload may be written to stdout** — the `_emitted` flag enforces this.
   Never `print()` to stdout; it corrupts the response.
+- **Payloads are ASCII-only JSON** (`json.dumps` default escaping — never
+  `ensure_ascii=False`). Flow parses query/action output as UTF-8 bytes, but reads
+  `context_menu` output via `StandardOutput.ReadToEnd()` with no encoding set, i.e. the
+  Windows ANSI code page (cp1252, cp950, …), unfixed through Flow 2.1.4. Raw UTF-8 there
+  garbled every `“”`/`…` (`â€œName`), broke the Rename drill's `→`, and mangled non-ASCII
+  names sent back as action params (v1.0.8 fix; `test_ascii_wire` guards it). The smoke
+  test's own UTF-8 decode can't see this, so keep that test.
 - **Flow raises `InvalidDataException` on ANY stderr output** — a single non-fatal warning
   kills every query. This bit us in v1.0.1: pycaw warns (to stderr) when a device's
   properties raise a COMError (some JBL / virtual-audio endpoints do). So warnings are
