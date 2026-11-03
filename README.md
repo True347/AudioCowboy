@@ -7,7 +7,7 @@ ac            →  🔊 Output   🎤 Input   📁 Profiles   💾 Save
 ac o [filter] →  pick the default output (playback) device
 ac i [filter] →  pick the default input  (recording) device
 ac s <name>   →  save the current input+output as a named profile
-ac p [filter] →  list profiles → Enter applies; right-click → Apply / Rename / Delete
+ac p [filter] →  list profiles → Enter applies; right-click → Apply / Link / Delete
 ac r [filter] →  rename a profile (pick one, then type the new name)
 ac d [filter] →  delete profiles (Enter removes; the list stays open)
 ac <name>     →  apply a profile straight from the top level (matches profile names)
@@ -77,7 +77,7 @@ no setup step. Restart Flow (or reload plugins) and type `ac`.
 | `ac o hdmi` | Same, filtered to devices whose name contains "hdmi". |
 | `ac i` | List active **input** devices; Enter sets the default. |
 | `ac s Gaming` | Save the current output+input devices as a profile named "Gaming" (overwrites if it exists). |
-| `ac p` | List saved profiles. Enter applies a profile; **Shift+Enter** opens its context menu (Apply / Link / Rename / Delete). A `⚠` marks a profile whose device can't be found right now; its context menu then offers the active devices to **link** (see *How it works*). The list also offers **Rename** and **Delete** entries. |
+| `ac p` | List saved profiles. Enter applies a profile; **Shift+Enter** opens its context menu (Apply / Link / Delete). A `⚠` marks a profile whose device can't be found right now; its context menu then offers the active devices to **link** (see *How it works*). The list also offers **Rename** and **Delete** entries. |
 | `ac p game` | Same, filtered by profile name. The best match (exact, then starts-with, then contains) is highlighted, so Enter applies it. |
 | `ac gaming` | Apply a profile **straight from the top level**: anything that isn't a sub-command is matched against profile names, ranked like `ac p`. If no name matches, the top menu is shown. A profile whose name starts with a sub-command word (e.g. `Out Loud`) is still reachable with `ac p`. |
 | `ac r` | Pick a profile, then type a new name (`Gaming → Streaming`) and press Enter. Renaming onto a name already in use is refused. |

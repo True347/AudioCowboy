@@ -243,14 +243,12 @@ def test_wire():
         assert err_q.strip() == "", "stderr for %r:\n%s" % (q, err_q)
         json.loads(out_q)
 
-    # profile context menu -> Apply + Rename (drill) + Delete
+    # profile context menu -> Apply + Delete (link entries only when a slot is unresolved)
     out_c, err_c = run_main({"method": "context_menu", "parameters": [["profile", "Gaming"]], "settings": {}})
     assert err_c.strip() == "", err_c
     objc = json.loads(out_c)
-    assert len(objc["result"]) == 3
-    assert objc["result"][0]["JsonRPCAction"]["method"] == "load_profile"
-    assert objc["result"][1]["JsonRPCAction"]["method"] == "Flow.Launcher.ChangeQuery"
-    assert objc["result"][2]["JsonRPCAction"]["method"] == "delete_profile"
+    assert [r["JsonRPCAction"]["method"] for r in objc["result"]] == [
+        "load_profile", "delete_profile"], objc
 
     # device context menu -> all roles + comms only
     out_d, _ = run_main({"method": "context_menu",
@@ -258,6 +256,12 @@ def test_wire():
     objd = json.loads(out_d)
     assert objd["result"][0]["JsonRPCAction"]["method"] == "set_default_output"
     assert objd["result"][1]["JsonRPCAction"]["method"] == "set_default_comm"
+
+    # No context-menu item may drill: Flow applies ChangeQuery without leaving the context
+    # menu, so the new text only filters the menu's own items (empty list, Enter dead).
+    for menu in (objc, objd):
+        for r in menu["result"]:
+            assert r["JsonRPCAction"]["method"] != "Flow.Launcher.ChangeQuery", r
 
     # drill-down result shape: ChangeQuery + keep-open flag
     top = json.loads(run_main({"method": "query", "parameters": [""], "settings": {}})[0])
@@ -409,8 +413,8 @@ def test_profile_ranking_wire():
 def test_ascii_wire():
     """Every payload must be ASCII-only JSON. Flow decodes context_menu output with the
     Windows ANSI code page (cp1252 on English Windows), so raw UTF-8 showed “Name” as
-    â€œNameâ€, broke the Rename drill's → and mangled non-ASCII names sent back as
-    action params. Issue #1 (follow-up)."""
+    â€œNameâ€ and mangled non-ASCII names sent back as action params. Issue #1
+    (follow-up)."""
     tmp = tempfile.mkdtemp()
     os.environ["APPDATA"] = tmp
     os.makedirs(os.path.join(tmp, "FlowLauncher"))
@@ -432,9 +436,14 @@ def test_ascii_wire():
         assert menu[0]["Title"] == "Apply profile “%s”" % name, menu[0]["Title"]
         assert menu[0]["JsonRPCAction"]["parameters"] == [name]
         assert menu[-1]["JsonRPCAction"]["parameters"] == [name]  # Delete
-        # Follow the Rename drill the way Flow does: its query text goes into the box.
-        box = menu[1]["JsonRPCAction"]["parameters"][0]
-        assert box == "ac r %s → " % name, box
+
+    # The → separator survives too: follow `ac r`'s drill into the rename step for each.
+    picks = as_flow_reads({"method": "query", "parameters": ["r"], "settings": {}})["result"]
+    boxes = [r["JsonRPCAction"]["parameters"][0] for r in picks
+             if r.get("JsonRPCAction", {}).get("method") == "Flow.Launcher.ChangeQuery"
+             and r["JsonRPCAction"]["parameters"][0].startswith("ac r ")]
+    assert boxes == ["ac r %s → " % n for n in names], boxes
+    for name, box in zip(names, boxes):
         step = as_flow_reads({"method": "query", "parameters": [box[len("ac "):]],
                               "settings": {}})["result"]
         assert [r["Title"] for r in step if r["Title"].startswith("Rename")] == [

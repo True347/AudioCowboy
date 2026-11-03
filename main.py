@@ -10,7 +10,7 @@ Flow.Launcher.ChangeQuery drill-down.
     ac o [filter]   list output (render) devices  -> Enter sets default output
     ac i [filter]   list input  (capture) devices -> Enter sets default input
     ac s [name]     save current devices as a named profile
-    ac p [filter]   list saved profiles -> Enter applies; right-click = Apply/Link/Rename/Delete
+    ac p [filter]   list saved profiles -> Enter applies; right-click = Apply/Link/Delete
     ac <name>       anything that isn't a sub-command matches profile names -> Enter applies
 
 Flow Launcher V1 Python model: the request arrives as JSON in ``sys.argv[1]`` and the
@@ -212,13 +212,15 @@ class AudioCowboy(object):
         kind = data[0]
         if kind == "profile" and len(data) >= 2:
             name = data[1]
+            # No Rename here: a context-menu item can't drill. Flow applies ChangeQuery
+            # without leaving the context menu, so the new text just filters the menu's own
+            # items (empty list, Enter does nothing), and each keystroke re-runs this
+            # handler synchronously. Rename lives at `ac r` and in the `ac p` list.
             return [
                 result("Apply profile “%s”" % name,
                        "Set both devices (all roles)", ICON_PROFILE,
                        method="load_profile", params=[name]),
             ] + self._link_items(name) + [
-                drill("Rename profile “%s”…" % name, "Give it a new name",
-                      "r " + name + _RENAME_SEP, ICON_PROFILE),
                 result("Delete profile “%s”" % name,
                        "Remove this profile permanently", ICON_DELETE,
                        method="delete_profile", params=[name]),

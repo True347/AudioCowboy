@@ -48,9 +48,9 @@ everything:
   `ensure_ascii=False`). Flow parses query/action output as UTF-8 bytes, but reads
   `context_menu` output via `StandardOutput.ReadToEnd()` with no encoding set, i.e. the
   Windows ANSI code page (cp1252, cp950, …), unfixed through Flow 2.1.4. Raw UTF-8 there
-  garbled every `“”`/`…` (`â€œName`), broke the Rename drill's `→`, and mangled non-ASCII
-  names sent back as action params (v1.0.8 fix; `test_ascii_wire` guards it). The smoke
-  test's own UTF-8 decode can't see this, so keep that test.
+  garbled every `“”`/`…` (`â€œName`) and mangled non-ASCII names sent back as action
+  params (v1.0.8 fix; `test_ascii_wire` guards it). The smoke test's own UTF-8 decode
+  can't see this, so keep that test.
 - **Flow raises `InvalidDataException` on ANY stderr output** — a single non-fatal warning
   kills every query. This bit us in v1.0.1: pycaw warns (to stderr) when a device's
   properties raise a COMError (some JBL / virtual-audio endpoints do). So warnings are
@@ -77,6 +77,15 @@ can't be distinguished on an empty query. The nested-menu feel is faked by `dril
 which returns a `Flow.Launcher.ChangeQuery` action that rewrites the search box and keeps
 the window open (`DontHideAfterAction: True`). Splitting into multiple keywords would
 require migrating to the `Python_v2` protocol.
+
+**`drill()` only works from query results, never from a context menu.** Flow applies
+`ChangeQuery` without leaving the context menu, so the new text only filters the menu's own
+items: empty list, Enter does nothing, and every keystroke re-runs `context_menu`
+synchronously on Flow's UI thread (one Python spawn each, plus a device enumeration for the
+link entries), so typing lags. Leaving first needs `BackToQueryResults` *then*
+`ChangeQuery`, but a V1 action can trigger only one Flow API call. The profile context menu
+had a Rename drill in v1.0.5–1.0.8 that never worked in real Flow (v1.0.9 removed it);
+`test_wire` now rejects a `ChangeQuery` in any context menu.
 
 ## Architecture
 
