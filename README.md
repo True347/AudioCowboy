@@ -7,7 +7,7 @@ ac            →  🔊 Output   🎤 Input   📁 Profiles   💾 Save
 ac o [filter] →  pick the default output (playback) device
 ac i [filter] →  pick the default input  (recording) device
 ac s <name>   →  save the current input+output as a named profile
-ac p [filter] →  list profiles → Enter applies; right-click → Apply / Link / Delete
+ac p [filter] →  list profiles → Enter applies; right-click → Apply / Delete (+ Link when a device is missing)
 ac r [filter] →  rename a profile (pick one, then type the new name)
 ac d [filter] →  delete profiles (Enter removes; the list stays open)
 ac <name>     →  apply a profile straight from the top level (matches profile names)
@@ -52,10 +52,10 @@ output/input*.
 
 ## Install
 
-**From the Flow Launcher plugin store** (once listed): open Flow, type
+**From the Flow Launcher plugin store**: open Flow, type
 `pm install AudioCowboy`, or find it in Settings → Plugin Store.
 
-**From a release zip** (or to test before the store listing):
+**From a release zip** (e.g. to get a new release before the store picks it up):
 ```
 pm install https://github.com/True347/AudioCowboy/releases/latest/download/Flow.Launcher.Plugin.AudioCowboy.zip
 ```
@@ -136,8 +136,9 @@ Writes are atomic (temp file + `os.replace`), so a crash mid-write can't corrupt
 - **A device won't switch** — make sure it's *Active* (plugged in / enabled) in Windows Sound settings.
 - **A profile can't find a device that is plugged in** (e.g. after switching a DAC between
   UAC1/UAC2, or a driver update) — Shift+Enter on the profile and pick *Use “…” as this
-  profile's output/input*; it's remembered from then on. `python tests\inspect_ids.py <name>`
-  shows each endpoint's ID, stable ID and state, to see what changed.
+  profile's output/input*; it's remembered from then on. To see what changed, run
+  `python tests\inspect_ids.py <name>` from a source checkout (see *Development*; the
+  plugin zip doesn't include `tests\`): it shows each endpoint's ID, stable ID and state.
 - **Nothing happens / errors** — check Flow's logs at `%APPDATA%\FlowLauncher\Logs\`.
 
 ---
